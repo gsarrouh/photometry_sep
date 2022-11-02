@@ -220,21 +220,23 @@ class Source_detector(object):
         return
 
 
-    def perform_source_detection(self, nsigma,npixels,nlevels,contrast,mode='hot',mask=None,filter_kernel=None,diag=False):
+    def perform_source_detection(self,det_dict,mode='hot',mask=None,filter_kernel=None,diag=False):
         """
         Perform source detection on the detection image with the parameters provided.
         Parameters
         ----------
-        nsigma: float
-            multiple above detection threshold for a pixel to be considered
-            a "detection"
-        npix: int
-            # of connected pixels for a source segmented to be counted as
-            a "detection"
-        nlevels: int
-            # of deblending levels
-        contrast: float
-            deblend contrast
+        det_dict: dict
+            dictionary containing the following fields:
+            nsigma: float
+                multiple above detection threshold for a pixel to be considered
+                a "detection"
+            npix: int
+                # of connected pixels for a source segmented to be counted as
+                a "detection"
+            nlevels: int
+                # of deblending levels
+            contrast: float
+                deblend contrast
         mode: str, 'hot' or 'cold' or 'warm'
             the detection mode being performed; hot for aggressive settings, cold for coarse settings
         mask: array-like
@@ -244,6 +246,11 @@ class Source_detector(object):
             to source detection
         """
         start_time = time.time()
+        # assign detection parameters
+        nsigma = det_dict['nsigma']
+        npixels = det_dict['npixels']
+        nlevels = det_dict['nlevels']
+        contrast = det_dict['contrast']
         
         objects, segm = sep.extract(self.det_im, nsigma, err=self.bkg_globalrms, mask=mask,
                               minarea=npixels, filter_kernel=filter_kernel, filter_type='matched',
@@ -572,7 +579,7 @@ class Source_detector(object):
         return
 
 
-    def make_detection_mode_mask(self,mode='cold',diag=False):
+    def make_detection_mode_mask(self,mode='cold',scale_detections=None,diag=False):
         """Make a mask from the previous detection mode segmentation map
         Parameters
         ----------
@@ -589,6 +596,9 @@ class Source_detector(object):
             segm_hot = getattr(self,'segm_hot')
             segm = segm_cold + segm_hot
         mask = segm != 0
+        
+        mask = self.make_mask_bigger(mask,dist_tol=scale_detections,diag=False)
+        
         setattr(self,mask_str,mask)
         if diag==True:
             plt.imshow(mask,vmin=0,vmax=1,cmap='Greys',origin='lower',interpolation='nearest')
@@ -626,7 +636,7 @@ class Source_detector(object):
         return new_mask
     
 
-    def make_bcg_mask_bigger(self,mask,dist_tol=1.5,diag=False):
+    def make_mask_bigger(self,mask,dist_tol=1.5,diag=False):
         """Make a mask including a buffer distance around bcg residual mask"""
         start_time = time.time()
         mask = mask == 0
@@ -733,13 +743,9 @@ class Source_detector(object):
             print('\nnew_labels: [{} ... {} ... {}]'.format(new_labels[0:4],new_labels[len(stage1_labels)-4:len(stage1_labels)+4],new_labels[-4:]))
         # reassign labels in cold mode segmentation map to new combined label indices
         if update_segm == True:
-            for ii,old_label,new_label in zip(np.arange(1,len(stage0_labels_old)+1),stage0_labels_old,stage0_labels_new):
-                # if ii%500==0:
-                #     print('Old-mode re-label: {} to {} - {}/{} ({:.2f}% complete)'.format(old_label,new_label,ii,len(stage0_labels_old),ii/len(stage0_labels_old)*100))
-                segm_old += len(stage1_labels)
-                indices = segm_old == len(stage1_labels)
-                segm_old[indices] = 0
-                segm_old += len(stage1_labels)
+            segm_old += len(stage1_labels)
+            indices = segm_old == len(stage1_labels)
+            segm_old[indices] = 0
         # combine hot/cold mode segmentation maps into a single map
         segm = segm_new + segm_old
         new_label_values = np.unique(segm)
@@ -753,6 +759,7 @@ class Source_detector(object):
         print('# of unique new labels: {}\nTotal # of segments in combined segmentation map: {}\nTotal # of sources in combined detection catalog: {}'.format(len(np.unique(new_label_values)),len(new_label_values),len(obj['x'])))
         print('\n\nFunction "combine_detection_modes()" took {:.3f} seconds to run'.format(time.time()-start_time))
         return
+
     
 
 
@@ -857,6 +864,9 @@ class Catalogor(object):
         self.color_aper = aper_min_diameter
         self.inst_zp_dict = {}
         self.kronrad = kronrad
+        self.unit_flux = unit_flux
+        if ref_band is not None:
+            self.ref_band = ref_band
 
         for i, filter in enumerate(self.master_filter_dict.keys()):
             filter_time = time.time()
@@ -873,6 +883,11 @@ class Catalogor(object):
             print("\n\nNow processing filter: {:s}\n".format(filter))
             data_data = fits.getdata(fn_data)
             data_wcs = WCS(header=fits.getheader(fn_data))
+            
+            mask_phot = data_data == 0
+            if mask is not None:
+                mask_phot+=mask
+            
             if zp is None:
                 data_zp = self.find_zeropoint_image(fn_data,AB=True)
                 self.inst_zp_dict[filter] = data_zp
@@ -888,9 +903,14 @@ class Catalogor(object):
 
             # >>>>> Important <<<<< ADU to flux density conversion 
             if unit_flux == 'nJy':
-                fact_to *= 10.**(0.4*(31.4 - data_zp)) # 25 for AB 25 mag system;  23.9 for uJy; 31.4 for nJy
-                if diag==True:
-                    print('\nADU-to-nJy flux conversion factor pre-extinction (10.**(0.4*(31.4 - instr_zp))): {:.4f}'.format(fact_to))
+                unit_zp = 31.4
+            elif unit_flux == 'uJy':
+                unit_zp = 23.9
+            elif unit_flux == '25ABmag':
+                unit_zp = 25
+            fact_to *= 10.**(0.4*(unit_zp - data_zp)) # 25 for AB 25 mag system;  23.9 for uJy; 31.4 for nJy
+            if diag==True:
+                print('\nADU-to-nJy flux conversion factor to units of {}, pre-extinction (10.**(0.4*(31.4 - instr_zp))): {:.4f}'.format(unit_flux,fact_to))
 
             # >>>>> Important <<<<< Extinction 
             if extinction==True:
@@ -923,7 +943,7 @@ class Catalogor(object):
                     bkgann = None
                 # fixed aperture photometry
                 flux, flux_err, flag = sep.sum_circle(data_data,objects['x'],objects['y'],aper_r * np.ones(len(objects['x'])),
-                                         err=None,mask=mask,gain=None,seg_id=seg_id,segmap=self.segm,
+                                         err=None,mask=mask_phot,gain=None,seg_id=seg_id,segmap=self.segm,
                                          bkgann=bkgann,subpix=5)
                 
                 key_flux = 'FLUX_APER{:02.0f}'.format(aper_d_arcsec*10)
@@ -965,7 +985,7 @@ class Catalogor(object):
                 
             # isophotal flux photometry
             flux, flux_err, flag = sep.sum_circle(data_data,objects['x'],objects['y'],aper_r * np.ones(len(objects['x'])),
-                                     err=None,mask=mask,gain=None,seg_id=-seg_id,segmap=self.segm,
+                                     err=None,mask=mask_phot,gain=None,seg_id=-seg_id,segmap=self.segm,
                                      bkgann=bkgann,subpix=5)
 
             # add designation for sources outside FOV (i.e. no data coverage)
@@ -987,7 +1007,7 @@ class Catalogor(object):
             
             # elliptical photometry
             if meas_kron_flux==True:
-                if (filter==ref_band) or (ref_band=='all'):
+                if (filter==self.ref_band) or (self.ref_band=='all'):
                     # set minimum aperture for kron apertures
                     aper_min_pix = aper_min_diameter / 2. / self.pix_scale  # minimum diameter 0.35"; aper_min_pix in pixels
                     # Now do KRON apertures; start w/ min circ aperture to avoid sources w/ kronrad==nan
@@ -1015,13 +1035,13 @@ class Catalogor(object):
                         bkgann_kron = None
 
                     flux, fluxerr, flag = sep.sum_circle(data_data, objects['x'],objects['y'],aper_min_pix,
-                                                            mask=mask,segmap=self.segm,seg_id=seg_id,
+                                                            mask=mask_phot,segmap=self.segm,seg_id=seg_id,
                                                             bkgann=bkgann,subpix=5)
 
                     kflux, kfluxerr, kflag = sep.sum_ellipse(data_data,objects['x'],objects['y'],
                                                              objects['a'],objects['b'],
                                                              objects['theta'],(kron_scale_fact*kronrad),
-                                                             mask=mask,seg_id=seg_id,segmap=self.segm,
+                                                             mask=mask_phot,seg_id=seg_id,segmap=self.segm,
                                                              bkgann=bkgann_kron,subpix=5)
 
                     flux[use_kron] = kflux[use_kron]
@@ -1069,7 +1089,7 @@ class Catalogor(object):
 
 
 
-    def create_cat(self,objects,obj_cols_to_use,cat_cols_names,kronrad=True,ref_band=None):
+    def create_cat(self,objects,obj_cols_to_use,cat_cols_names,kronrad=True):
         """Compile photometry in multiple bands into a single Astropy QTable
         Parameters
         ----------
@@ -1094,7 +1114,7 @@ class Catalogor(object):
         for filter,filter_dict in self.meas_catalogs_tbs.items():
             for col_name in self.aper_col_names:
                 self.cat[col_name+'_'+filter] = filter_dict[col_name]
-        self.cat['PHOT_FLAG'] = self.meas_catalogs_tbs[ref_band]['PHOT_FLAG']
+        self.cat['PHOT_FLAG'] = self.meas_catalogs_tbs[self.ref_band]['PHOT_FLAG']
 
         if kronrad==True:
             kron_index = self.cat.colnames.index('A')
@@ -1103,7 +1123,7 @@ class Catalogor(object):
 
 
 
-    def add_total_fluxes(self,fixed_aper,ref_band,aperture_diameters):
+    def add_total_fluxes(self,fixed_aper,aperture_diameters):
         """
         Add total fluxes for all filters, where the ratio of total-to-fixed_aper
         flux is equal in all bands and set by the ratio in the ref_band.
@@ -1115,12 +1135,12 @@ class Catalogor(object):
             the filter which will set the total-to-fixed_aper flux ratio for all filters
         """
         start_time = time.time()
-        ref_total_flux = self.cat['FLUX_AUTO_{}'.format(ref_band)]
-        ref_fixed_aper_flux = self.cat['FLUX_APER{:02.0f}_{}'.format(fixed_aper*10,ref_band)]
+        ref_total_flux = self.cat['FLUX_AUTO_{}'.format(self.ref_band)]
+        ref_fixed_aper_flux = self.cat['FLUX_APER{:02.0f}_{}'.format(fixed_aper*10,self.ref_band)]
         total_to_fixed_flux_ratio = (ref_total_flux / ref_fixed_aper_flux)
 
         for filter in self.master_filter_dict.keys():
-            if filter == ref_band:
+            if filter == self.ref_band:
                 pass
             else:
                 filt_fixed_aper_flux = self.cat['FLUX_APER{:02.0f}_{}'.format(fixed_aper*10,filter)]
@@ -1131,12 +1151,26 @@ class Catalogor(object):
 
 
 
-    def find_empty_aperture_positions(self,mask,n_apertures,diag=False):
+    def find_empty_aperture_positions(self,det_dict,bkg_method='sep',box_size=75,kernel_size=3,mask=None,n_apertures=2000,diag=False):
         """
         define a function to measure the flux in N empty apertures (where the
         apertures may vary in size). produce a histogram of the results.
         Parameters
         ----------
+        det_dict: dict
+            dictionary containing the following fields:
+            nsigma: float
+                multiple above detection threshold for a pixel to be considered
+                a "detection"
+            npix: int
+                # of connected pixels for a source segmented to be counted as
+                a "detection"
+            nlevels: int
+                # of deblending levels
+            contrast: float
+                deblend contrast
+        bkg_method: str
+            package used in calculating the background during source detection; either 'sep' or 'photutils'
         mask: bool array
             mask applied during source detection
         n_apertures: int
@@ -1146,79 +1180,145 @@ class Catalogor(object):
             combined segm+mask img
         """
         start_time = time.time()
-        print('Beginning search for empty apertures...')
+        
+        self.empty_aper_positions_x = {}
+        self.empty_aper_positions_y = {}
 
-        segm_temp_arr = self.segm + mask.astype('int32')
-        segm_temp_img = SegmentationImage(segm_temp_arr)
+        # assign detection parameters
+        nsigma = det_dict['nsigma']
+        npixels = det_dict['npixels']
+        nlevels = det_dict['nlevels']
+        contrast = det_dict['contrast']
+        
+        for filter in self.master_filter_dict.keys():
+            print('\nWorking on filter: {}...'.format(filter))
+            
+            filter_time = time.time()
+            self.empty_aper_positions_x[filter] = []
+            self.empty_aper_positions_y[filter] = []
+            filter_dict = self.master_filter_dict[filter]
 
-        if diag==True:
-            fig, ax1 = plt.subplots(1,1,figsize=(6,6))
-            im1 = ax1.imshow(mask,vmin=0,vmax=1,cmap='gray_r',origin='lower',interpolation='nearest')
-            ax1.set_title('Mask being applied to segm')
-            divider = make_axes_locatable(ax1)
-            cax = divider.append_axes('right', size='5%', pad=0.05)
-            fig.colorbar(im1, cax=cax, orientation='vertical')
-            plt.show()
+            fn_data = filter_dict['fn_im_matchf444w_sub']
+            
+            data_data = fits.getdata(fn_data)
+            data_data = data_data.byteswap(inplace=True).newbyteorder()
+            
+            mask_phot = data_data == 0
+            if mask is not None:
+                mask_phot+=mask
+            
+            if method == 'sep':
+                # measure a spatially varying background on the image
+                bkg = sep.Background(data_data, mask=mask_phot, bw=box_size,
+                                     bh=box_size, fw=kernel_size, fh=kernel_size)
+                # get a "global" mean and noise of the image background:
+                bkg_globalback = bkg.globalback
+                bkg_globalrms = bkg.globalrms
+                bkg_image = bkg.back()
+                bkg_rms = bkg.rms()
 
-            fig, ax = plt.subplots(1, 1, figsize=(6,6))
-            cmap = segm_temp_img.make_cmap(seed=123)
-            ax.imshow(segm_temp_img, origin='lower', cmap=cmap, interpolation='nearest')
-            ax1.set_title('segm + mask')
-            ax.set_title('Empty apertures: 0/{}'.format(n_apertures))
-            plt.show()
-            plt.close()
+                print('Median bkg: {:.5e}'.format(bkg_globalback))
+                print('Median rms: {:.5e}'.format(bkg_globalrms))
 
-        # store dimensions of segmentation map
-        N, M = segm_temp_arr.shape
-        # initialize a list to store position of empty apertures
-        self.empty_positions_x = []
-        self.empty_positions_y = []
-        # store radius of aperture in pixels
-        radius = np.max(self.aperture_diameters) / 2. / self.pix_scale
-        if diag==True:
-            print('\nMax radius of empty aperture: {:.2f}" or {:.3f}px'.format(radius*self.pix_scale,radius))
+            elif method == 'photutils':
+                # 2D background estimation
+                sigma_clip = SigmaClip(sigma=3., maxiters=50)
+                bkg_estimator = SExtractorBackground()
+                bkg_rms_estimator = MADStdBackgroundRMS()
 
-        n_apertures_found = 0
-        while n_apertures_found < n_apertures:
-            position_sum = 1
-            while position_sum > 0:
-                pos_check = 1
-                while pos_check > 0:
-                    # generate random position
-                    x = random.randint(0, N-1)
-                    y = random.randint(0, M-1)
-                    #
-                    pos_check = segm_temp_arr[x,y]
-                position = np.transpose([y,x])#(x,y)
-                aper = CircularAperture(position, r=radius)
-                temp_phot_table = aperture_photometry(segm_temp_img, aper)
-                position_sum = temp_phot_table['aperture_sum'][0]
-            self.empty_positions_x.append(y)      # to correct for transpose line above, i.e. this is not a mistake. y appends to x_list, x to y_list
-            self.empty_positions_y.append(x)
+                #compute background and update user on key stats
+                bkg = Background2D(data_data,box_size,filter_size=kernel_size,edge_method='pad',sigma_clip=sigma_clip,
+                                   bkg_estimator=bkg_estimator,bkgrms_estimator=bkg_rms_estimator,
+                                   coverage_mask=mask_phot,fill_value=0.)
+                # get a "global" mean and noise of the image background:
+                bkg_globalback = bkg.background_median
+                bkg_globalrms = bkg.background_rms_median
+                bkg_image = bkg.background
+                bkg_rms = bkg.background_rms
+
+                print('Median bkg: {:.5e}'.format(bkg_globalback))
+                print('Median rms: {:.5e}'.format(bkg_globalrms))
+            
+            
+            
+            objects, segm = sep.extract(data_data, nsigma, err=bkg_globalrms, mask=mask_phot,
+                              minarea=npixels, filter_kernel=filter_kernel, filter_type='matched',
+                              deblend_nthresh=nlevels, deblend_cont=contrast, clean=True,
+                              clean_param=1.0, segmentation_map=True)
+            
+            print('Beginning search for empty apertures...')
+
+            segm_temp_arr = segm + mask_phot.astype('int32')
+            segm_temp_img = SegmentationImage(segm_temp_arr)
+
             if diag==True:
-                if len(self.empty_positions_x)%np.floor(n_apertures/4) == 0:
-                    print('Empty positions found so far: {}/{}'.format(len(self.empty_positions_x),n_apertures))
-            n_apertures_found+=1
+                fig, ax1 = plt.subplots(1,1,figsize=(6,6))
+                im1 = ax1.imshow(mask,vmin=0,vmax=1,cmap='gray_r',origin='lower',interpolation='nearest')
+                ax1.set_title('Mask being applied to segm')
+                divider = make_axes_locatable(ax1)
+                cax = divider.append_axes('right', size='5%', pad=0.05)
+                fig.colorbar(im1, cax=cax, orientation='vertical')
+                plt.show()
+
+                fig, ax = plt.subplots(1, 1, figsize=(6,6))
+                cmap = segm_temp_img.make_cmap(seed=123)
+                ax.imshow(segm_temp_img, origin='lower', cmap=cmap, interpolation='nearest')
+                ax1.set_title('segm + mask')
+                ax.set_title('Empty apertures: 0/{}'.format(n_apertures))
+                plt.show()
+                plt.close()
+
+            # store dimensions of segmentation map
+            N, M = segm_temp_arr.shape
+            # initialize a list to store position of empty apertures
+            self.empty_aper_positions_x[filter] = []
+            self.empty_aper_positions_y[filter] = []
+            # store radius of aperture in pixels
+            radius = np.max(self.aperture_diameters) / 2. / self.pix_scale
+            if diag==True:
+                print('\nMax radius of empty aperture: {:.2f}" or {:.3f}px'.format(radius*self.pix_scale,radius))
+
+            n_apertures_found = 0
+            while n_apertures_found < n_apertures:
+                position_sum = 1
+                while position_sum > 0:
+                    pos_check = 1
+                    while pos_check > 0:
+                        # generate random position
+                        x = random.randint(0, N-1)
+                        y = random.randint(0, M-1)
+                        #
+                        pos_check = segm_temp_arr[x,y]
+                    position = np.transpose([y,x])#(x,y)
+                    aper = CircularAperture(position, r=radius)
+                    temp_phot_table = aperture_photometry(segm_temp_img, aper)
+                    position_sum = temp_phot_table['aperture_sum'][0]
+                self.empty_aper_positions_x[filter].append(y)      # to correct for transpose line above, i.e. this is not a mistake. y appends to x_list, x to y_list
+                self.empty_aper_positions_y[filter].append(x)
+                if diag==True:
+                    if len(self.empty_aper_positions_x[filter])%np.floor(n_apertures/4) == 0:
+                        print('Empty positions found so far: {}/{}'.format(len(self.empty_aper_positions_x[filter]),n_apertures))
+                n_apertures_found+=1
+                #
             #
-        #
-        if diag==True:
-            from matplotlib.patches import Circle
-            fig, ax = plt.subplots(1, 1, figsize=(8,8))
-            cmap = segm_temp_img.make_cmap(seed=123)
-            ax.imshow(segm_temp_img, origin='lower', cmap=cmap, interpolation='nearest')
-            ax.set_title('Empty apertures: {}'.format(n_apertures))
-            for xx,yy in zip(self.empty_positions_x,self.empty_positions_y):
-                circ = Circle((xx,yy),radius,edgecolor='r',fill=False,linewidth=2.)
-                ax.add_patch(circ)
-            plt.show()
-            plt.close()
+            if diag==True and filter == self.ref_band:
+                from matplotlib.patches import Circle
+                fig, ax = plt.subplots(1, 1, figsize=(8,8))
+                cmap = segm_temp_img.make_cmap(seed=123)
+                ax.imshow(segm_temp_img, origin='lower', cmap=cmap, interpolation='nearest')
+                ax.set_title('Empty apertures: {}'.format(n_apertures))
+                for xx,yy in zip(self.empty_aper_positions_x[filter],self.empty_aper_positions_y[filter]):
+                    circ = Circle((xx,yy),radius,edgecolor='r',fill=False,linewidth=2.)
+                    ax.add_patch(circ)
+                plt.show()
+                plt.close()
         #
         print('\n\nFunction "find_empty_aperture_positions()" took {:.3f} seconds to run.'.format(time.time()-start_time))
         return
 
 
 
-    def measure_empty_aperture_fixed_apertures(self,mask,ref_band='F160W',fit_param_guess=None,hist_n_bins=50,
+    def measure_empty_aperture_fixed_apertures(self,mask,fit_param_guess=None,hist_n_bins=50,
                                             hist_x_lim=[-2e3,2e3],psfmatched=True,bkg_sub=True,use_wht=True,
                                             output_dir='./',diag=True):
         """
@@ -1301,7 +1401,7 @@ class Catalogor(object):
             for aper_size in range(len(diameters_arcsec)):
                 aper_r = radii[aper_size]     # in pix
 
-                flux, flux_err, flag = sep.sum_circle(img, self.empty_positions_x,self.empty_positions_y,
+                flux, flux_err, flag = sep.sum_circle(img, self.empty_aper_positions_x[filter],self.empty_aper_positions_y[filter],
                                          aper_r, err=None, mask=mask, gain=None)
 
                 len_counts = len(flux)
@@ -1362,7 +1462,7 @@ class Catalogor(object):
             """store sigmas for fixed apertures in each filter in a dict for output"""
             # self.sigma_dict_final[filter] = sigma_list_filter_fixed_apers
 
-            if filter==ref_band:
+            if filter==self.ref_band:
                 # now fit a power law
                 alpha_guess,beta_guess = fit_param_guess
                 x0 = fit_param_guess
@@ -1473,9 +1573,14 @@ class Catalogor(object):
             time_filter = time.time()
 
             # Conversion factor to convert fluxes to certain unit
-            unit_flux = 'nJy'
+            if self.unit_flux == 'nJy':
+                unit_zp = 31.4
+            elif self.unit_flux == 'uJy':
+                unit_zp = 23.9
+            elif self.unit_flux == '25ABmag':
+                unit_zp = 25
             fact_to = 1.
-            fact_to = 10.**(0.4*(31.4 - self.inst_zp_dict[filter])) # 23.9 for uJy; 31.4 for nJy
+            fact_to = 10.**(0.4*(unit_zp - self.inst_zp_dict[filter])) # 23.9 for uJy; 31.4 for nJy
             print('ADU-to-nJy flux conversion factor: {}'.format(fact_to))
 
             if use_wht==True:
@@ -1503,7 +1608,7 @@ class Catalogor(object):
                     # std_err_filter_aperture = std_err_list_filter[jj]
                     
                     # set errors for all sources without data coverage to zero
-                    zero_coverage_mask = self.cat['FLUX_APER{:02.0f}_{}'.format(aper*10,filter)] == 0.
+                    zero_coverage_mask = np.isnan(self.cat['FLUX_APER{:02.0f}_{}'.format(aper*10,filter)])
                     flux[zero_coverage_mask] = 0.
                     
                     area = np.pi * aper_r**2        # compute area of aperture for calculation of avg noise at position of each source, in units of pixels
@@ -1534,11 +1639,11 @@ class Catalogor(object):
                     err_mask = self.cat['FLUXERR_APER{:02.0f}_{}'.format(aper*10,filter)] == 0.
                     self.cat['FLUXERR_APER{:02.0f}_{}'.format(aper*10,filter)][err_mask] = np.nan
                     
-                    N = self.cat['FLUXERR_APER{:02.0f}_{}'.format(aper*10,filter)] /u.nJy
-                    S = self.cat['FLUX_APER{:02.0f}_{}'.format(aper*10,filter)] /u.nJy
-                    SNR = S / N
+                    fluxerr = self.cat['FLUXERR_APER{:02.0f}_{}'.format(aper*10,filter)] /u.nJy
+                    flux = self.cat['FLUX_APER{:02.0f}_{}'.format(aper*10,filter)] /u.nJy
+                    SNR = flux / fluxerr
 
-                    mag = -2.5 * np.log10(S) + 34.1
+                    mag = -2.5 * np.log10(flux) + 34.1
                     sel = (~np.isnan(SNR) & np.isfinite(SNR))
                     print('\nFor filter {} in APER{:02.0f}:'.format(filter,aper*10))
                     SNR_list = [50.,20.,10.,5.]
@@ -1570,7 +1675,7 @@ class Catalogor(object):
     
 
 
-    def assign_phot_errors_kron_apertures(self,mask=None,ref_band='all',kron_scale_fact=2.5,use_wht=True,diag=False,diag_II=False):
+    def assign_phot_errors_kron_apertures(self,mask=None,kron_scale_fact=2.5,use_wht=True,diag=False,diag_II=False):
         """
         define a function to assign photometric errors to all sources in the
         self.catalogue table list of error images (these are weight maps where:
@@ -1589,39 +1694,45 @@ class Catalogor(object):
             add diagnostic columns to catalog table for further investigation
         """
         start_time = time.time()
-        alpha = self.alpha_dict[ref_band]
-        beta = self.beta_dict[ref_band]
+        alpha = self.alpha_dict[self.ref_band]
+        beta = self.beta_dict[self.ref_band]
 
         if diag_II==True:
-            print('\nKron aperture error scalings for sigma = alpha * N**beta, where N = sqrt(pi*r**2):\nFilter: {};   alpha: {:.5f};   beta: {:.5f}'.format(ref_band,alpha,beta))
+            print('\nKron aperture error scalings for sigma = alpha * N**beta, where N = sqrt(pi*r**2):\nFilter: {};   alpha: {:.5f};   beta: {:.5f}'.format(self.ref_band,alpha,beta))
             try:
-                new_col_name = 'FLUXERR_AUTO_{}_total_noise'.format(ref_band)
+                new_col_name = 'FLUXERR_AUTO_{}_total_noise'.format(self.ref_band)
                 new_col = Column(-99,name=new_col_name)
-                index = self.cat.colnames.index('KRON_RADIUS_{}'.format(ref_band))
+                index = self.cat.colnames.index('KRON_RADIUS_{}'.format(self.ref_band))
                 self.cat.add_column(new_col, index=(index+1))
 
-                new_col_name = 'FLUXERR_AUTO_{}_avg_noise'.format(ref_band)
+                new_col_name = 'FLUXERR_AUTO_{}_avg_noise'.format(self.ref_band)
                 new_col = Column(-99,name=new_col_name)
-                index = self.cat.colnames.index('FLUXERR_AUTO_{}'.format(ref_band))
+                index = self.cat.colnames.index('FLUXERR_AUTO_{}'.format(self.ref_band))
                 self.cat.add_column(new_col, index=(index+1))
 
-                new_col_name = 'FLUXERR_AUTO_{}_std_error'.format(ref_band)
+                new_col_name = 'FLUXERR_AUTO_{}_std_error'.format(self.ref_band)
                 new_col = Column(-99,name=new_col_name)
-                index = self.cat.colnames.index('FLUXERR_AUTO_{}'.format(ref_band))
+                index = self.cat.colnames.index('FLUXERR_AUTO_{}'.format(self.ref_band))
                 self.cat.add_column(new_col, index=(index+1))
             except:
                 pass
 
+        fn_wht = self.master_filter_dict[self.ref_band]['fn_rms']
         if self.inst_zp_dict==None:
             data_zp = find_zeropoint_image(fn_wht,AB=True)
             print('zp: {:.5f}'.format(data_zp))
         else:
-            data_zp = self.inst_zp_dict[ref_band]
+            data_zp = self.inst_zp_dict[self.ref_band]
 
         # Conversion factor to convert fluxes to certain unit
-        unit_flux = 'nJy'
+        if self.unit_flux == 'nJy':
+            unit_zp = 31.4
+        elif self.unit_flux == 'uJy':
+            unit_zp = 23.9
+        elif self.unit_flux == '25ABmag':
+            unit_zp = 25
         fact_to = 1
-        fact_to *= 10.**(0.4*(31.4 - data_zp)) # 23.9 for nJy; 31.4 for nJy
+        fact_to *= 10.**(0.4*(unit_zp - data_zp)) # 23.9 for nJy; 31.4 for nJy
         print('ADU-to-nJy flux conversion factor: {}'.format(fact_to))
 
         # compute errors in the reference band
@@ -1635,7 +1746,6 @@ class Catalogor(object):
         area = np.pi * circ_kron_radius**2  # in pix
 
         if use_wht == True:
-            fn_wht = self.master_filter_dict[ref_band]['fn_rms']
             img = fits.getdata(fn_wht)
             img = img.byteswap(inplace=True).newbyteorder()
             # img[img!=0] = (1 / np.sqrt(img[img!=0]) )
@@ -1663,8 +1773,8 @@ class Catalogor(object):
             avg_aper_error = flux / area
 
             if diag_II==True:
-                self.cat['FLUXERR_AUTO_{}_total_noise'.format(ref_band)] = flux
-                self.cat['FLUXERR_AUTO_{}_avg_noise'.format(ref_band)] = avg_aper_error
+                self.cat['FLUXERR_AUTO_{}_total_noise'.format(self.ref_band)] = flux
+                self.cat['FLUXERR_AUTO_{}_avg_noise'.format(self.ref_band)] = avg_aper_error
 
         # now multiply by "standard error' based on size of kron radius of an empty aperture
         max_kron_error = 0
@@ -1677,36 +1787,36 @@ class Catalogor(object):
         empty_aperture_error_ISO = self.error_power_law_scaling((empty_aperture_radius_ISO * 2.),alpha,beta)
 
         if use_wht == True:
-            self.cat['FLUXERR_AUTO_{}'.format(ref_band)] = empty_aperture_error_kron * avg_aper_error * fact_to
-            self.cat['FLUXERR_AUTO_{}'.format(ref_band)].unit = u.nJy
+            self.cat['FLUXERR_AUTO_{}'.format(self.ref_band)] = empty_aperture_error_kron * avg_aper_error * fact_to
+            self.cat['FLUXERR_AUTO_{}'.format(self.ref_band)].unit = u.nJy
             if diag_II==True:
-                self.cat['FLUXERR_AUTO_{}_std_error'.format(ref_band)] = empty_aperture_error_kron
+                self.cat['FLUXERR_AUTO_{}_std_error'.format(self.ref_band)] = empty_aperture_error_kron
             if diag==True:
-                print('Median FLUXERR_AUTO_{}: {:.4e}'.format(ref_band,np.median(self.cat['FLUXERR_AUTO_{}'.format(ref_band)])))
+                print('Median FLUXERR_AUTO_{}: {:.4e}'.format(self.ref_band,np.median(self.cat['FLUXERR_AUTO_{}'.format(self.ref_band)])))
 
         elif use_wht == False:
-            self.cat['FLUXERR_AUTO_{}'.format(ref_band)] = empty_aperture_error_kron * fact_to
-            self.cat['FLUXERR_AUTO_{}'.format(ref_band)].unit = u.nJy
+            self.cat['FLUXERR_AUTO_{}'.format(self.ref_band)] = empty_aperture_error_kron * fact_to
+            self.cat['FLUXERR_AUTO_{}'.format(self.ref_band)].unit = u.nJy
             if diag==True:
-                print('Median FLUXERR_AUTO_{}: {:.4e}'.format(ref_band,np.median(self.cat['FLUXERR_AUTO_{}'.format(ref_band)])))
+                print('Median FLUXERR_AUTO_{}: {:.4e}'.format(self.ref_band,np.median(self.cat['FLUXERR_AUTO_{}'.format(self.ref_band)])))
 
         # add designation for sources outside FOV (i.e. no data coverage) 
-        err_mask = self.cat['FLUXERR_AUTO_{}'.format(ref_band)] == 0.
-        self.cat['FLUXERR_AUTO_{}'.format(ref_band)][err_mask] = np.nan
+        err_mask = self.cat['FLUXERR_AUTO_{}'.format(self.ref_band)] == 0.
+        self.cat['FLUXERR_AUTO_{}'.format(self.ref_band)][err_mask] = np.nan
         
-        nan_mask = np.isnan(self.cat['FLUXERR_AUTO_{}'.format(ref_band)])
-        max_kron_error = np.max(self.cat['FLUXERR_AUTO_{}'.format(ref_band)][~nan_mask])
-        index = np.where(self.cat['FLUXERR_AUTO_{}'.format(ref_band)]==max_kron_error)[0]
+        nan_mask = np.isnan(self.cat['FLUXERR_AUTO_{}'.format(self.ref_band)])
+        max_kron_error = np.max(self.cat['FLUXERR_AUTO_{}'.format(self.ref_band)][~nan_mask])
+        index = np.where(self.cat['FLUXERR_AUTO_{}'.format(self.ref_band)]==max_kron_error)[0]
         max_kron_aperture = empty_aperture_radius_kron.data[index][0]
         if diag==True:
             print('\nMax_kron_error: {:.4f} on circularized kron_radius of {:.3f}"'.format(max_kron_error,max_kron_aperture))
 
-        N = self.cat['FLUXERR_AUTO_{}'.format(ref_band)]/u.nJy
-        S = self.cat['FLUX_AUTO_{}'.format(ref_band)]/u.nJy
-        SNR = S / N
-        mag = -2.5*np.log10(S) + 34.1
+        fluxerr = self.cat['FLUXERR_AUTO_{}'.format(self.ref_band)]/u.nJy
+        flux = self.cat['FLUX_AUTO_{}'.format(self.ref_band)]/u.nJy
+        SNR = flux / fluxerr
+        mag = -2.5*np.log10(flux) + 34.1
 
-        print('\nFor filter: {}'.format(ref_band))
+        print('\nFor filter: {}'.format(self.ref_band))
         sel = (~np.isnan(SNR) & np.isfinite(SNR))
         SNR_list = [50.,20.,10.,5.]
         for SNR_ref in SNR_list:
@@ -1714,13 +1824,13 @@ class Catalogor(object):
             print('Index: {};   SNR = {:.2f};   mag = {:.3f};   Circ. kron radius = {:.5f}"'.format(index,SNR[sel][index],mag[sel][index],(circ_kron_radius[sel][index]*self.pix_scale)))
 
         # now assign errors to all the other bands
-        ref_total_flux = self.cat['FLUX_AUTO_{}'.format(ref_band)]
-        ref_fixed_flux = self.cat['FLUX_APER{:02.0f}_{}'.format(self.color_aper*10,ref_band)]
+        ref_total_flux = self.cat['FLUX_AUTO_{}'.format(self.ref_band)]
+        ref_fixed_flux = self.cat['FLUX_APER{:02.0f}_{}'.format(self.color_aper*10,self.ref_band)]
         total_to_fixed_flux_ratio = np.abs(ref_total_flux / ref_fixed_flux)
 
         for ii,filter in enumerate(self.master_filter_dict.keys()):
             print('\n\nNow working on filter {}...\n'.format(filter))
-            if filter==ref_band:
+            if filter==self.ref_band:
                 pass
             else:
                 self.cat['FLUXERR_AUTO_{}'.format(filter)] = self.cat['FLUXERR_APER{:02.0f}_{}'.format(self.color_aper*10,filter)]  * total_to_fixed_flux_ratio
@@ -1730,10 +1840,10 @@ class Catalogor(object):
                 err_mask = self.cat['FLUXERR_AUTO_{}'.format(filter)] == 0.
                 self.cat['FLUXERR_AUTO_{}'.format(filter)][err_mask] = np.nan
                 
-                N = self.cat['FLUXERR_AUTO_{}'.format(filter)]/u.nJy
-                S = self.cat['FLUX_AUTO_{}'.format(filter)]/u.nJy
-                SNR = S / N
-                mag = -2.5*np.log10(S) + 34.1
+                fluxerr = self.cat['FLUXERR_AUTO_{}'.format(filter)]/u.nJy
+                flux = self.cat['FLUX_AUTO_{}'.format(filter)]/u.nJy
+                SNR = flux / fluxerr
+                mag = -2.5*np.log10(flux) + 34.1
 
                 print('\nFor filter: {}'.format(filter))
                 sel = (~np.isnan(SNR) & np.isfinite(SNR))
@@ -1749,7 +1859,7 @@ class Catalogor(object):
 
                   
 
-    def assign_phot_errors_iso_apertures(self,mask=None,ref_band='F200W',use_wht=True,diag=False):
+    def assign_phot_errors_iso_apertures(self,mask=None,use_wht=True,diag=False):
         """
         define a function to assign photometric errors to all sources in the
         self.catalogue table list of error images (these are weight maps where:
@@ -1766,20 +1876,8 @@ class Catalogor(object):
             print general dianostic information
         """
         start_time = time.time()
-        alpha = self.alpha_dict[ref_band]
-        beta = self.beta_dict[ref_band]
-
-        if self.inst_zp_dict==None:
-            data_zp = find_zeropoint_image(fn_wht,AB=True)
-            print('zp: {:.5f}'.format(data_zp))
-        else:
-            data_zp = self.inst_zp_dict[ref_band]
-
-        # Conversion factor to convert fluxes to certain unit
-        unit_flux = 'nJy'
-        fact_to = 1
-        fact_to *= 10.**(0.4*(31.4 - data_zp)) # 23.9 for nJy; 31.4 for nJy
-        print('ADU-to-nJy flux conversion factor: {}'.format(fact_to))
+        alpha = self.alpha_dict[self.ref_band]
+        beta = self.beta_dict[self.ref_band]
 
         # now multiply by "standard error' based on size of kron radius of an empty aperture
         empty_aperture_radius_ISO = np.sqrt(self.cat['AREA']/np.pi) * self.pix_scale       # equivalent circular radius for ISO AREA, in arcsec
@@ -1793,7 +1891,24 @@ class Catalogor(object):
                 img = fits.getdata(fn_wht)
                 img = img.byteswap(inplace=True).newbyteorder()
                 # img[img!=0] = (1 / np.sqrt(img[img!=0]) )
+                # get zero point
+                if self.inst_zp_dict==None:
+                    data_zp = find_zeropoint_image(fn_wht,AB=True)
+                    print('zp: {:.5f}'.format(data_zp))
+                else:
+                    data_zp = self.inst_zp_dict[self.ref_band]
 
+                # Conversion factor to convert fluxes to certain unit
+                if self.unit_flux == 'nJy':
+                    unit_zp = 31.4
+                elif self.unit_flux == 'uJy':
+                    unit_zp = 23.9
+                elif self.unit_flux == '25ABmag':
+                    unit_zp = 25
+                fact_to = 1
+                fact_to *= 10.**(0.4*(unit_zp - data_zp)) # 23.9 for nJy; 31.4 for nJy
+                print('ADU-to-nJy flux conversion factor: {}'.format(fact_to))
+                
                 seg_id = np.arange(1, len(self.cat['X'])+1,1, dtype=np.int32)
 
                 # ISO error
@@ -1821,10 +1936,10 @@ class Catalogor(object):
                     print('Median FLUXERR_ISO_{}: {:.4e}'.format(filter,np.median(self.cat['FLUXERR_ISO_{}'.format(filter)][~nan_mask])))
                     print('# of NaN ISO errors: {}'.format(np.sum(nan_mask)))
 
-            N = self.cat['FLUXERR_ISO_{}'.format(filter)]/u.nJy
-            S = self.cat['FLUX_ISO_{}'.format(filter)]/u.nJy
-            SNR = S / N
-            mag = -2.5*np.log10(S) + 34.1
+            fluxerr = self.cat['FLUXERR_ISO_{}'.format(filter)]/u.nJy
+            flux = self.cat['FLUX_ISO_{}'.format(filter)]/u.nJy
+            SNR = flux / fluxerr
+            mag = -2.5*np.log10(flux) + 34.1
 
             sel = (~np.isnan(SNR) & np.isfinite(SNR))
             SNR_list = [50.,20.,10.,5.]
@@ -1839,7 +1954,7 @@ class Catalogor(object):
 
 
 
-    def apply_aper_corr_factors(self,fn_ref_band_cog,ref_band='F160W',apply_to_fixed_aper=False,apply_to_color_aper=False,
+    def apply_aper_corr_factors(self,fn_ref_band_cog,apply_to_fixed_aper=False,apply_to_color_aper=False,
                                 apply_to_kron_aper=True,kron_scale_fact=2.5,save_fig=False,fn_save=None,diag=False):
         """
         Compute aperture corrections for fraction of light from psf which falls outside
@@ -1947,10 +2062,10 @@ class Catalogor(object):
         gs = {"hspace":0, "height_ratios":[2,1]}   #make a tiled-plot like vdB2013 w/ fractions below, this line sets the proporitons of plots in the figure
 
         fig, (ax1,ax2) = plt.subplots(2,1,figsize=(8,12),sharex=True,gridspec_kw=gs)
-        fig.suptitle('{} PSF & Total Flux Correction Factors'.format(ref_band),fontsize=20)
+        fig.suptitle('{} PSF & Total Flux Correction Factors'.format(self.ref_band),fontsize=20)
         fig.patch.set_facecolor('beige')
 
-        ax1.plot((x_cog_radii*self.pix_scale),y_cog_flux,linestyle='solid',linewidth=2.5,color='cornflowerblue',label='HST/WFC3 PSF - {}'.format(ref_band))
+        ax1.plot((x_cog_radii*self.pix_scale),y_cog_flux,linestyle='solid',linewidth=2.5,color='cornflowerblue',label='HST/WFC3 PSF - {}'.format(self.ref_band))
         ax1.plot([self.color_aper/2.,self.color_aper/2.],[0,1.01],linestyle='dotted',linewidth=1.5)
         ax1.text(self.color_aper/2.+0.02,0.25,'Catalog aperture',fontsize=14)
         ax1.set_xlabel('Radius [arcsec]',fontsize=16)
@@ -2001,8 +2116,8 @@ class Catalogor(object):
 
 
 
-    def match_sources_by_RA_DEC(self,ref_cat,ref_cat_ids=['RA','DEC'],match_zspec=False,matching_tol=0.3,diag=True):
-        """ Match sources in GS' catalog to sources from a reference catalog, for
+    def match_sources_by_RA_DEC(cat,cat_ids=['RA','DEC'],ref_cat=None,ref_cat_ids=['RA','DEC'],matching_tol=0.3,diag=True):
+        """ Match sources in one catalog to sources from a reference catalog, for
         comparing properties.
         Parameters
         ----------
@@ -2011,49 +2126,75 @@ class Catalogor(object):
         ref_cat_ids: array
             identifies the names of the RA/DEC column in the ref_cat. must be in
             the order [RA,DEC]
+        matching_tol: float
+            the maximum distance between two sources in order to be considered a match; in arcsec
+        Returns
+        ----------
+        indices_cat_common, indices_ref_cat_common: array
+            indices of sources in cat, ref_cat, which are matched between both catalogs
+        unique_cat, unique_ref_cat: array
+            indices of sources in cat, ref_cat which are unique to each catalog (i.e. not found in the other)
         """
         start_time = time.time()
         if diag==True:
-            print('length of GS cat catalog: {} rows.\nlength of cat_to_match catalog: {} rows.'.format(len(self.cat),len(ref_cat)))
-        # compute a spatial tolerance in arcsec
-        tol_degrees = matching_tol / 3600         # convert tolerance to degrees
-
+            print('length of cat catalog: {} rows.\nlength of cat_to_match catalog: {} rows.'.format(len(cat),len(ref_cat)))
+        
         n_matched = 0
-        n_spec = 0
-        self.indices_cat = []
-        self.indices_ref_cat = []
+        indices_cat_common = []
+        indices_ref_cat_common = []
+        
+        # store coords of ref cat
+        RA_to_match = ref_cat[ref_cat_ids[0]] /u.deg * np.pi / 180 * u.rad   # convert to rad
+        DEC_to_match = ref_cat[ref_cat_ids[1]] /u.deg * np.pi / 180 * u.rad   # convert to rad
+        # print('RA_to_match: ',RA_to_match)
+            
+        # loop through sources in cat one at a time to find matches
+        for source1 in range(len(cat)):
 
-        for source1 in range(len(self.cat)):
+            RA_cat = cat[cat_ids[0]][source1] * np.pi / 180 * u.rad   # convert to rad
+            DEC_cat = cat[cat_ids[1]][source1] * np.pi / 180 * u.rad   # convert to rad
+            # print('RA_cat: ',RA_cat)
+            # print('DEC_cat: ',DEC_cat)
 
-            RA_cat = self.cat['RA'][source1] / u.deg
-            DEC_cat = self.cat['DEC'][source1] / u.deg
-            if source1%int(len(self.cat)/4) == 0:
-                frac_done = (source1 / len(self.cat)) * 100
+            if source1%int(len(cat)/4) == 0:
+                frac_done = (source1 / len(cat)) * 100
                 if diag==True:
-                    print('\nMatching row {}\n% complete: {:.2f}\n# matched: {}\n# z_spec: {}\nTime elapsed: {}s'.format(source1,frac_done,n_matched,n_spec,(time.time()-start_time)))
+                    print('\nMatching row {}\n% complete: {:.2f}\n# matched: {}\nTime elapsed: {}s'.format(source1,frac_done,n_matched,(time.time()-start_time)))
 
-            for source2 in range(len(ref_cat)):
 
-                # if ref_cat['use_phot'][source2] == 1:
-                RA_to_match = ref_cat[ref_cat_ids[0]][source2]
-                DEC_to_match = ref_cat[ref_cat_ids[1]][source2]
+            dist_astropy = astropy.coordinates.angular_separation(RA_cat,DEC_cat,RA_to_match,DEC_to_match)
+            dist_astropy = dist_astropy / u.rad * 180 / np.pi * 3600  # convert back to degrees then arcsec
+            
+            matches = dist_astropy < matching_tol
 
-                if (np.abs(RA_to_match - RA_cat) < tol_degrees) and (np.abs(DEC_to_match - DEC_cat) < tol_degrees):
-                    n_matched+=1
-                    self.indices_cat.append(source1)
-                    self.indices_ref_cat.append(source2)
-                    if match_zspec==True:
-                        if ref_cat['z_phot'][source2] == -99:
-                            pass
-                        else:
-                            if ref_cat['z_spec'][source2] != -1:
-                                n_spec+=1
-        if match_zspec==True:
-            print('# matched objects w/ z_spec: {}'.format(n_spec))
+            if np.sum(matches) > 1:
+                print('WARNING: {} matches found for cat source {}'.format(np.sum(matches),source1))
+            
+            if np.sum(matches) == 1:
+                
+                index = np.where(matches == True)[0][0]
+                # print('source: {};   match index: {}'.format(source1,index))
+                n_matched+=1
+                indices_cat_common.append(source1)
+                indices_ref_cat_common.append(index)
+                    
+            
+        # determine indices unique to each catalog
+        arr_cat = np.asarray(indices_cat_common.copy())
+        arr_ref_cat = np.asarray(indices_ref_cat_common.copy())
+        
+        unique_cat = np.arange(len(cat['RA']))
+        unique_ref_cat = np.arange(len(ref_cat[ref_cat_ids[0]]))
+        
+        test = np.isin(unique_cat,arr_cat)
+        test_ref = np.isin(unique_ref_cat,arr_ref_cat)
+        
+        unique_cat = np.delete(unique_cat,test)
+        unique_ref_cat = np.delete(unique_ref_cat,test_ref)
 
-        print('\n\n# of matched objects between cat & ref_cat: {}\nIndices for cat stored as "self.indices_cat".\nIndices for ref_cat stored as "self.indices_ref_cat".'.format(n_matched,))
+        print('\n\n# of matched objects between cat & ref_cat: {}\n# sources unique to cat: {}\n# of sources unique to ref cat: {}\n\nIndices for cat stored as "self.indices_cat".\nIndices for ref_cat stored as "self.indices_ref_cat".'.format(n_matched,len(unique_cat),len(unique_ref_cat)))
         print('\n\nFunction "match_sources_by_RA_DEC()" took {:.3f} seconds to run.'.format(time.time()-start_time))
-        return self.indices_cat, self.indices_ref_cat
+        return indices_cat_common, indices_ref_cat_common, unique_cat, unique_ref_cat
 
 
     def plot_zphot_zspec(self,zmax=8.,outlier_limit=0.1,scale='log',field_name='Some field...',
@@ -2405,43 +2546,6 @@ class Catalogor(object):
         ax2.minorticks_on()
         ax2.yaxis.set_label_position("right")
 
-    #     ax1 = axs.flat[2]
-    #     if ref_cat is not None:
-    #         ax1.scatter(I_ref_cat,(V_ref_cat-I_ref_cat),c='b',marker='.',alpha=0.35,linewidths=0,s=20,label=ref_cat_name)
-    #     if id_stars == True:
-    #         ax1.scatter(F444W_GS[~stars]-F277W_GS[~stars],(F356W_GS[~stars]-F277W_GS[~stars]),c='k',marker='.',alpha=0.35,linewidths=0,s=20,label='GS cat')
-    #         ax1.scatter(F444W_GS[stars]-F277W_GS[stars],(F356W_GS[stars]-F277W_GS[stars]),c='r',marker='*',alpha=0.5,linewidths=0,s=25,label='Stars')
-    #     else:
-    #         ax1.scatter(F444W_GS-F277W_GS,F356W_GS-F277W_GS,c='k',marker='.',alpha=0.35,linewidths=0,s=20,label='GS cat')
-    #     ax1.set_xlabel("F200W", fontsize=25)
-    #     ax1.set_xscale('linear')
-    #     ax1.set_xlim(x_range)
-    #     ax1.set_ylim(y_range)
-    #     ax1.set_ylabel("F150W - F200W", fontsize=25)
-    #     ax1.set_yscale('linear')
-    #     ax1.tick_params(axis='both', which='both',direction='in',color='k',top=True,right=True,labelright=True,labelsize=15)
-    #     ax1.minorticks_on()
-    #     # ax1.legend(loc='upper left', fontsize=15,markerscale=5)
-    #     ax1.yaxis.set_label_position("right")
-
-    #     ax2 = axs.flat[3]
-    #     if ref_cat is not None:
-    #         ax2.scatter(I_ref_cat,(B_ref_cat-V_ref_cat),c='b',marker='.',alpha=0.35,linewidths=0,s=20)
-    #     if id_stars == True:
-    #         ax2.scatter(I_GS[~stars],(B_GS[~stars]-V_GS[~stars]),c='k',marker='.',alpha=0.35,linewidths=0,s=20)
-    #         ax2.scatter(I_GS[stars],(B_GS[stars]-V_GS[stars]),c='r',marker='*',alpha=0.55,linewidths=0,s=25)
-    #     else:
-    #         ax2.scatter(I_GS,(B_GS-V_GS),c='r',marker='.',alpha=0.35,linewidths=0,s=20)
-    #     ax2.set_xlabel("F200W", fontsize=25)
-    #     ax2.set_xscale('linear')
-    #     ax2.set_xlim(x_range)
-    #     ax2.set_ylim(y_range)
-    #     ax2.set_ylabel("F090W - F150W", fontsize=25)
-    #     ax2.set_yscale('linear')
-    #     ax2.tick_params(axis='both', which='both',direction='in',color='k',top=True,right=True,labelright=True,labelsize=15)
-    #     ax2.minorticks_on()
-    #     ax2.yaxis.set_label_position("right")
-
         plt.subplots_adjust(wspace=0, hspace=0)
         if save_fig==True:
             if ref_cat is not None:
@@ -2634,7 +2738,7 @@ class Catalogor(object):
 
     """The following functions add flag columns to the catalog"""
 
-    def add_star_flag(self,method='flux_radius',fn_star_coords=None,ref_band='F160W',max_flux_radius=3.,
+    def add_star_flag(self,method='flux_radius',fn_star_coords=None,max_flux_radius=3.,
                   min_flux_radius=1.,max_mag=24.5,save_fig=False,fn_save=None,diag=True):
         """
         Add a column which identifies stars in the catalog.
@@ -2670,14 +2774,14 @@ class Catalogor(object):
 
         elif method == 'flux_radius':       # identify stars based on FLUX_RADIUS v magnitude
             flux_radius = self.cat['FLUX_RADIUS']
-            mag = -2.5 * np.log10(self.cat['FLUX_AUTO_{}'.format(ref_band)] / u.nJy) + 31.4
+            mag = -2.5 * np.log10(self.cat['FLUX_AUTO_{}'.format(self.ref_band)] / u.nJy) + 31.4
 
             star_sel = (min_flux_radius<flux_radius) & (flux_radius<max_flux_radius) & (mag<max_mag)
             self.cat['STAR_FLAG'][star_sel] = 1
 
             #VISUALIZE
             fig, ax = plt.subplots(1,1,figsize=(8,8))
-            fig.suptitle('Star Identification in {}\nMethod: FLUX_RADIUS'.format(ref_band),fontsize=20)
+            fig.suptitle('Star Identification in {}\nMethod: FLUX_RADIUS'.format(self.ref_band),fontsize=20)
             fig.patch.set_facecolor('white')
             
             ax.scatter(mag[~star_sel],flux_radius[~star_sel],color='k',marker='.',s=20,alpha=0.5)
@@ -2685,7 +2789,7 @@ class Catalogor(object):
             ax.plot([16,max_mag],[max_flux_radius,max_flux_radius],':k',linewidth=1.)
             ax.plot([16,max_mag],[min_flux_radius,min_flux_radius],':k',linewidth=1.)
             ax.plot([max_mag,max_mag],[min_flux_radius,max_flux_radius],':k',linewidth=1.)
-            ax.set_xlabel('MAG_AUTO_{}'.format(ref_band),fontsize=15)
+            ax.set_xlabel('MAG_AUTO_{}'.format(self.ref_band),fontsize=15)
             ax.set_ylabel('FLUX_RADIUS [pix]',fontsize=15)
             ax.set_xlim([16,34])
             ax.set_yscale('log')
@@ -2700,12 +2804,12 @@ class Catalogor(object):
 
         nstars = np.sum(self.cat['STAR_FLAG']==1)
         if diag==True:
-            print('N_stars identified in filter {}: {}\nMethod of identification: {}'.format(ref_band,nstars,method))
+            print('N_stars identified in filter {}: {}\nMethod of identification: {}'.format(self.ref_band,nstars,method))
         print('\n\nFunction "add_star_flag()" took {:.3f} seconds to run.'.format(time.time()-start_time))
         return
 
 
-    def add_flux_radius(self,mask=None,flux_frac=[0.5],ref_band='F160W',diag=True):
+    def add_flux_radius(self,mask=None,flux_frac=[0.5],diag=True):
         """
         Compute and add the half-light radius (or some other fraction); equivalent
         to Source Extractor's "FLUX_RADIUS" parameter.
@@ -2721,12 +2825,12 @@ class Catalogor(object):
         """
         start_time = time.time()
 
-        data = fits.getdata(self.master_filter_dict[ref_band]['fn_im_matchf444w_sub'])
+        data = fits.getdata(self.master_filter_dict[self.ref_band]['fn_im_matchf444w_sub'])
         data = data.byteswap(inplace=True).newbyteorder()
 
         seg_id = np.arange(1,len(self.cat['X'])+1,1,dtype='int32')
         r, flag = sep.flux_radius(data,self.cat['X'],self.cat['Y'],6.*self.cat['A'],flux_frac,
-                                  normflux=self.cat['FLUX_AUTO_{}'.format(ref_band)],mask=mask,
+                                  normflux=self.cat['FLUX_AUTO_{}'.format(self.ref_band)],mask=mask,
                                   seg_id=seg_id, segmap=self.segm,subpix=1)
 
         print(r)
